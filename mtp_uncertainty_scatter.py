@@ -1,39 +1,37 @@
 """
-Uncertainty scatter plots for the guide's exact request:
-  "For example, for entropy, 10% training data, for HHAR ... plot the scatter
-   plot (with values being the Entropy value itself). Similarly for other
-   metrics, training sizes and datasets."
+Uncertainty scatter data for the guide's request, NOW INCLUDING BALD in the
+same CSV as entropy/LC/margin, computed from the SAME trained model on the
+SAME unlabeled pool.
 
-SEPARATE deliverable from mtp_active_learning.py's AL-round comparison.
-Does not touch the AL loop, K-Means selection, or retraining -- K-Means /
-Silhouette-based K selection belongs only to the active-learning candidate
-selection stage, not to this scatter-plot deliverable.
-
-NESTING NOTE: for a given seed, the RNG used to pick the labeled subset is
-seeded by (seed, activity label) only -- NOT by the fraction. That means the
-same shuffled order is reused across 10%/20%/40%, so labeled_10% is
-automatically a PREFIX of labeled_20%, which is a prefix of labeled_40%.
-This gives a clean "as training data grows, how does uncertainty change"
-comparison per seed, without needing any extra code for it.
+WHY THIS CHANGED FROM THE EARLIER VERSION:
+------------------------------------------------------------------------
+BALD was previously computed by a separate script that reconstructed
+mtp_random_split.py's TEST set and loaded a separately-trained checkpoint.
+That meant BALD's sample_index did NOT refer to the same physical window as
+entropy/LC/margin's sample_index for the "same" dataset/fraction -- making
+any 4-way intersection across metrics invalid. This version computes BALD
+right here, on the exact same pool_x used for entropy/LC/margin, with the
+exact same model instance already in memory -- so all four metrics now
+share one sample_index space and can be validly intersected.
 
 For each (dataset, fraction), this script:
-  1. Runs all 6 seeds: splits raw signal into held-out TEST (untouched),
-     LABELED (nested prefix at the target fraction), and UNLABELED POOL.
-  2. Trains one model per seed on LABELED.
-  3. Scores the UNLABELED POOL (never the test set) with that seed's model.
-  4. Computes entropy, least confidence, margin per pool sample.
-  5. Saves the raw values to CSV (sample_index, entropy, least_confidence,
-     margin) per (dataset, fraction, seed) -- 4*3*6 = 72 CSV files.
-  6. Produces ONE combined scatter plot per (dataset, fraction, metric) with
-     all 6 seeds overlaid (distinct colors, legend) -- 4*3*3 = 36 PNGs total,
-     not 216, so the deliverable stays manageable while keeping all seed
-     variation visible.
+  1. Splits raw signal 3 ways per activity: held-out TEST (untouched),
+     LABELED (at the target fraction), UNLABELED POOL (the rest). Leak-safe
+     contiguous-block splitting, same as mtp_random_split.py.
+  2. Trains ONE model on LABELED.
+  3. Single forward pass (dropout off) on the UNLABELED POOL -> entropy,
+     least confidence, margin.
+  4. MC-Dropout (N stochastic passes, dropout kept active, BatchNorm fixed
+     at eval) on the SAME UNLABELED POOL, SAME model -> BALD.
+  5. Saves all four metrics to one CSV:
+     uncertainty_csv/uncertainty_<dataset>_<fraction>pct_seed<seed>.csv
+     columns: sample_index, entropy, least_confidence, margin, bald
 
-COST: 4 datasets x 3 fractions x 6 seeds = 72 model trainings.
+6 seeds per (dataset, fraction); a later cleanup step keeps only the
+best-accuracy seed's file (same as before -- unchanged from prior version).
 """
 
 import copy
-import csv
 import random
 from pathlib import Path
 
@@ -66,6 +64,7 @@ MAX_EPOCHS = 60
 PATIENCE = 15
 BATCH_SIZE = 128
 VAL_SHARE_OF_LABELED = 0.15
+MC_PASSES = 30  # stochastic forward passes for BALD
 
 SEED_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
 
@@ -191,22 +190,64 @@ def train_model(train_x, train_y, n_features, n_classes, seed):
 
 
 def score_pool(model, pool_x):
+    """Single forward pass, dropout OFF -- used for entropy/LC/margin."""
     pool_x_n = normalize_per_window(pool_x)
     loader = DataLoader(TensorDataset(torch.from_numpy(pool_x_n)), batch_size=BATCH_SIZE)
     all_probs = []
+    model.eval()
     with torch.no_grad():
         for (xb,) in loader:
             all_probs.append(torch.softmax(model(xb.to(device)), dim=1).cpu().numpy())
     return np.concatenate(all_probs, axis=0)
 
 
-def save_csv(dataset_name, fraction, seed, entropy_vals, lc_vals, margin_vals):
+def enable_dropout_only(model):
+    """Keep BatchNorm in eval (fixed running stats) but turn Dropout back
+    to train mode -- the standard MC-Dropout setup, so BALD isn't polluted
+    by BatchNorm using batch statistics instead of its learned running ones."""
+    model.eval()
+    for module in model.modules():
+        if isinstance(module, (nn.Dropout, nn.Dropout1d, nn.Dropout2d, nn.Dropout3d)):
+            module.train()
+
+
+def mc_dropout_probabilities(model, pool_x, n_passes):
+    """Returns shape (n_passes, n_samples, n_classes), scored on the SAME
+    pool_x used for entropy/LC/margin above, with the SAME model."""
+    pool_x_n = normalize_per_window(pool_x)
+    loader = DataLoader(TensorDataset(torch.from_numpy(pool_x_n)), batch_size=BATCH_SIZE, shuffle=False)
+    enable_dropout_only(model)
+    all_passes = []
+    with torch.no_grad():
+        for _ in range(n_passes):
+            pass_probs = []
+            for (xb,) in loader:
+                probs = torch.softmax(model(xb.to(device)), dim=1).cpu().numpy()
+                pass_probs.append(probs)
+            all_passes.append(np.concatenate(pass_probs, axis=0))
+    return np.stack(all_passes, axis=0)
+
+
+def entropy_from_probabilities(probs):
+    probs = np.clip(probs, 1e-12, 1.0)
+    return -np.sum(probs * np.log(probs), axis=-1)
+
+
+def compute_bald(mc_probs):
+    """BALD(x) = H(mean_t p_t) - mean_t H(p_t). Higher = more epistemic
+    uncertainty (the model's passes disagree with each other)."""
+    mean_probs = np.mean(mc_probs, axis=0)
+    predictive_entropy = entropy_from_probabilities(mean_probs)
+    expected_entropy = np.mean(entropy_from_probabilities(mc_probs), axis=0)
+    return np.maximum(predictive_entropy - expected_entropy, 0.0)
+
+
+def save_csv(dataset_name, fraction, seed, entropy_vals, lc_vals, margin_vals, bald_vals):
     fname = CSV_DIR / f"uncertainty_{dataset_name}_{int(fraction*100)}pct_seed{seed}.csv"
     with open(fname, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["sample_index", "entropy", "least_confidence", "margin"])
-        for i, (e, lc, m) in enumerate(zip(entropy_vals, lc_vals, margin_vals)):
-            writer.writerow([i, e, lc, m])
+        f.write("sample_index,entropy,least_confidence,margin,bald\n")
+        for i, (e, lc, m, b) in enumerate(zip(entropy_vals, lc_vals, margin_vals, bald_vals)):
+            f.write(f"{i},{e},{lc},{m},{b}\n")
     return fname
 
 
@@ -232,29 +273,19 @@ for dataset_name in DATASETS:
 
     for fraction in LABELED_FRACTIONS:
         print(f"\n-- {int(fraction*100)}% labeled --")
-        # Collect all seeds' results here before plotting, so each metric's
-        # plot for this (dataset, fraction) can overlay all 6 seeds at once.
-        seed_results = {}
 
         for seed in SEEDS:
             labeled_x_list, labeled_y_list = [], []
             pool_x_list, pool_y_list = [], []
 
             for label, values in raw_by_activity:
-                # Test block: seeded by (seed, label) only -- same across fractions.
                 _, _, x_rest, y_rest = random_contiguous_split(values, label, TEST_FRACTION, window_size, seed=seed + label)
-
                 labeled_fraction_of_rest = min(fraction / (1 - TEST_FRACTION), 0.95)
                 n_rest = len(y_rest)
                 n_labeled = max(1, int(round(labeled_fraction_of_rest * n_rest)))
-
-                # Seeded by (seed, label) only -- NOT fraction -- so the same
-                # permutation is reused at 10%/20%/40%, making labeled_10% a
-                # prefix of labeled_20%, a prefix of labeled_40%, per seed.
                 rng = np.random.default_rng(seed + label + 999)
                 perm = rng.permutation(n_rest)
                 labeled_idx, pool_idx = perm[:n_labeled], perm[n_labeled:]
-
                 labeled_x_list.append(x_rest[labeled_idx])
                 labeled_y_list.append(y_rest[labeled_idx])
                 pool_x_list.append(x_rest[pool_idx])
@@ -266,37 +297,23 @@ for dataset_name in DATASETS:
             pool_y = np.concatenate(pool_y_list)
 
             model = train_model(labeled_x, labeled_y, n_features, n_classes, seed=seed)
-            probs = score_pool(model, pool_x)
 
+            # Single pass (dropout off) -- entropy, LC, margin.
+            probs = score_pool(model, pool_x)
             entropy_vals = -np.sum(probs * np.log(probs + 1e-12), axis=1)
             lc_vals = 1 - np.max(probs, axis=1)
             sorted_p = np.sort(probs, axis=1)
             margin_vals = sorted_p[:, -1] - sorted_p[:, -2]
 
-            csv_path = save_csv(dataset_name, fraction, seed, entropy_vals, lc_vals, margin_vals)
-            seed_results[seed] = {"entropy": entropy_vals, "least_confidence": lc_vals, "margin": margin_vals}
-            print(f"  seed {seed}: labeled={len(labeled_y)}, pool={len(pool_y)}, saved {csv_path}")
+            # MC-Dropout on the SAME pool, SAME model -- BALD.
+            mc_probs = mc_dropout_probabilities(model, pool_x, MC_PASSES)
+            bald_vals = compute_bald(mc_probs)
 
-        # One combined plot per metric, all 6 seeds overlaid.
-        for metric_name in ["entropy", "least_confidence", "margin"]:
-            plt.figure(figsize=(11, 5))
-            for i, seed in enumerate(SEEDS):
-                values = seed_results[seed][metric_name]
-                plt.scatter(
-                    np.arange(len(values)), values, s=4, alpha=0.3,
-                    color=SEED_COLORS[i % len(SEED_COLORS)], label=f"seed {seed}",
-                )
-            plt.xlabel("Sample index (unlabeled pool)")
-            plt.ylabel(metric_name.replace("_", " ").title())
-            plt.title(
-                f"{metric_name.replace('_', ' ').title()} — {dataset_name.upper()} "
-                f"({int(fraction*100)}% training data, all 6 seeds)"
+            csv_path = save_csv(dataset_name, fraction, seed, entropy_vals, lc_vals, margin_vals, bald_vals)
+            print(
+                f"  seed {seed}: labeled={len(labeled_y)}, pool={len(pool_y)}, "
+                f"mean bald={bald_vals.mean():.4f}, saved {csv_path}"
             )
-            plt.legend(markerscale=3, fontsize=8, ncol=6, loc="upper center", bbox_to_anchor=(0.5, -0.15))
-            plt.tight_layout()
-            fname = f"uncertainty_{dataset_name}_{int(fraction*100)}pct_{metric_name}.png"
-            plt.savefig(fname, dpi=150, bbox_inches="tight")
-            plt.close()
-            print(f"  Saved {fname}")
 
-print("\nAll 72 CSVs and 36 combined scatter plots complete.")
+print("\nAll CSVs (entropy, least_confidence, margin, bald in one file each) complete.")
+print("Run mtp_cleanup_uncertainty_csv.py next to keep only the best-seed file per (dataset, fraction).")
